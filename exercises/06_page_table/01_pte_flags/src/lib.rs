@@ -57,28 +57,27 @@ const PPN_MASK: u64 = (1u64 << 44) - 1; // 44-bit PPN
 ///
 /// Hint: Shift PPN left by PPN_SHIFT bits, then OR with flags.
 pub fn make_pte(ppn: u64, flags: u64) -> u64 {
-    // TODO: Construct page table entry using ppn and flags
-    todo!()
+    // Mask both operands so a caller cannot smuggle bits into the reserved [63:54] field or
+    // set RSW by accident; the PPN field is exactly 44 bits wide.
+    let ppn_field = (ppn & PPN_MASK) << PPN_SHIFT;
+    ppn_field | (flags & 0xFF)
 }
 
 /// Extract physical page number (PPN) from page table entry.
 ///
 /// Hint: Right shift by PPN_SHIFT bits, then AND with PPN_MASK.
 pub fn extract_ppn(pte: u64) -> u64 {
-    // TODO: Extract PPN from pte
-    todo!()
+    (pte >> PPN_SHIFT) & PPN_MASK
 }
 
 /// Extract flags (lower 8 bits) from page table entry.
 pub fn extract_flags(pte: u64) -> u64 {
-    // TODO: Extract lower 8-bit flags
-    todo!()
+    pte & 0xFF
 }
 
 /// Check whether page table entry is valid (V bit set).
 pub fn is_valid(pte: u64) -> bool {
-    // TODO: Check PTE_V
-    todo!()
+    pte & PTE_V != 0
 }
 
 /// Determine whether page table entry is a leaf PTE.
@@ -86,8 +85,10 @@ pub fn is_valid(pte: u64) -> bool {
 /// In SV39, if any of R, W, X bits is set, the PTE is a leaf,
 /// pointing to the final physical page. Otherwise it points to next-level page table.
 pub fn is_leaf(pte: u64) -> bool {
-    // TODO: Check if any of R/W/X bits is set
-    todo!()
+    // Per the SV39 spec a PTE with none of R/W/X set is a pointer to the next level; any one
+    // of them makes it a leaf. A *valid* leaf must have R set (R=0,W=1 is reserved), which we
+    // deliberately do not enforce here since the tests probe the raw bit rule.
+    pte & (PTE_R | PTE_W | PTE_X) != 0
 }
 
 /// Check whether page table entry permits the requested access based on given permissions.
@@ -98,8 +99,22 @@ pub fn is_leaf(pte: u64) -> bool {
 ///
 /// Returns true iff: PTE is valid, and each requested permission is satisfied.
 pub fn check_permission(pte: u64, read: bool, write: bool, execute: bool) -> bool {
-    // TODO: First check if valid, then check each requested permission
-    todo!()
+    if !is_valid(pte) {
+        return false;
+    }
+    // Fold the requests into the required-bit mask once, then test containment: cheaper to
+    // read than three separate branches and it also accepts "no requirement" trivially.
+    let mut required = 0u64;
+    if read {
+        required |= PTE_R;
+    }
+    if write {
+        required |= PTE_W;
+    }
+    if execute {
+        required |= PTE_X;
+    }
+    pte & required == required
 }
 
 #[cfg(test)]

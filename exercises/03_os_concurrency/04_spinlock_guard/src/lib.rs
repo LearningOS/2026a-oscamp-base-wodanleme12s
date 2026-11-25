@@ -39,9 +39,27 @@ impl<T> SpinLock<T> {
     ///
     /// TODO: Spin-wait to acquire lock (compare_exchange), return SpinGuard on success.
     pub fn lock(&self) -> SpinGuard<'_, T> {
-        // TODO: Spin-wait to acquire lock
-        // TODO: Return SpinGuard { lock: self }
-        todo!()
+        // Bounded backoff instead of a hot CAS storm: after `SPIN_LIMIT` failed attempts we
+        // hand the timeslice back to the OS. That makes the lock safe to hold across code
+        // that may block, at the cost of one syscall per preemption.
+        const SPIN_LIMIT: u32 = 32;
+        let mut spins = 0u32;
+        loop {
+            match self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return SpinGuard { lock: self },
+                Err(_) => {
+                    core::hint::spin_loop();
+                    spins += 1;
+                    if spins >= SPIN_LIMIT {
+                        std::thread::yield_now();
+                        spins = 0;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -51,7 +69,9 @@ impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // Reaching here proves this guard owns the lock, so the aliasing rule for
+        // UnsafeCell ("no simultaneous mutable access") is satisfied.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -59,7 +79,7 @@ impl<T> Deref for SpinGuard<'_, T> {
 // Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -67,7 +87,9 @@ impl<T> DerefMut for SpinGuard<'_, T> {
 // Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Drop runs during unwinding too, which is exactly why an intentional panic in a
+        // held region cannot leave the lock permanently claimed.
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 

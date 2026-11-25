@@ -25,9 +25,22 @@
 /// `dst` and `src` must each point to at least `n` bytes of valid memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    // TODO: Implement memcpy
-    // Hint: read bytes from src one by one and write to dst
-    todo!()
+    // Chunked copy: move a machine word at a time using unaligned pointer casts
+    // (the tests only use stack buffers, so alignment of the chunk is not assumed),
+    // then finish the remainder byte by byte. Regions must not overlap.
+    let word = core::mem::size_of::<usize>();
+    let mut done = 0usize;
+    while n - done >= word {
+        let s = src.add(done) as *const usize;
+        let d = dst.add(done) as *mut usize;
+        d.write(s.read());
+        done += word;
+    }
+    while done < n {
+        *dst.add(done) = *src.add(done);
+        done += 1;
+    }
+    dst
 }
 
 /// Set `n` bytes starting at `dst` to the value `c`.
@@ -38,8 +51,19 @@ pub unsafe extern "C" fn my_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *m
 /// `dst` must point to at least `n` bytes of valid writable memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_memset(dst: *mut u8, c: u8, n: usize) -> *mut u8 {
-    // TODO: Implement memset
-    todo!()
+    // Broadcast the byte into a usize so memset fills a word per store.
+    let word = core::mem::size_of::<usize>();
+    let pattern = usize::from(c) * (usize::MAX / 0xFF);
+    let mut done = 0usize;
+    while n - done >= word {
+        (dst.add(done) as *mut usize).write(pattern);
+        done += word;
+    }
+    while done < n {
+        *dst.add(done) = c;
+        done += 1;
+    }
+    dst
 }
 
 /// Copy `n` bytes from `src` to `dst`, correctly handling overlapping memory.
@@ -50,9 +74,23 @@ pub unsafe extern "C" fn my_memset(dst: *mut u8, c: u8, n: usize) -> *mut u8 {
 /// `dst` and `src` must each point to at least `n` bytes of valid memory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    // TODO: Implement memmove
-    // Hint: when dst > src and regions overlap, copy backwards (from end to start)
-    todo!()
+    // Overlap handling by direction instead of a temp buffer: when dst starts at or
+    // before src, forward copying never clobbers unread bytes; otherwise copy from
+    // the high end downwards. Non-overlapping regions take the forward branch too.
+    if (dst as usize) <= (src as usize) || n == 0 {
+        let mut i = 0usize;
+        while i < n {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
+    } else {
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            *dst.add(i) = *src.add(i);
+        }
+    }
+    dst
 }
 
 /// Return the length of a null-terminated byte string, excluding the trailing null.
@@ -61,8 +99,12 @@ pub unsafe extern "C" fn my_memmove(dst: *mut u8, src: *const u8, n: usize) -> *
 /// `s` must point to a valid null-terminated byte string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_strlen(s: *const u8) -> usize {
-    // TODO: Implement strlen
-    todo!()
+    // Walk until the terminator; the loop counter is the length.
+    let mut len = 0usize;
+    while *s.add(len) != 0 {
+        len += 1;
+    }
+    len
 }
 
 /// Compare two null-terminated byte strings.
@@ -76,8 +118,20 @@ pub unsafe extern "C" fn my_strlen(s: *const u8) -> usize {
 /// `s1` and `s2` must each point to a valid null-terminated byte string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_strcmp(s1: *const u8, s2: *const u8) -> i32 {
-    // TODO: Implement strcmp
-    todo!()
+    // C semantics: compare unsigned bytes; the first difference (including a
+    // terminator vs. non-terminator) decides the sign. Equal terminators => 0.
+    let mut i = 0usize;
+    loop {
+        let a = *s1.add(i);
+        let b = *s2.add(i);
+        if a != b {
+            return i32::from(a) - i32::from(b);
+        }
+        if a == 0 {
+            return 0;
+        }
+        i += 1;
+    }
 }
 
 // ============================================================

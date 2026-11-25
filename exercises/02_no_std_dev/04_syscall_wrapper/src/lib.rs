@@ -53,23 +53,56 @@ pub struct SyscallABI {
 
 /// Return the x86_64 Linux syscall ABI description
 pub fn x86_64_abi() -> SyscallABI {
-    // TODO: Fill in the x86_64 syscall ABI
-    // Hint: x86_64 uses the "syscall" instruction, syscall number in rax
-    todo!()
+    // x86_64 is the odd one out: the number goes in rax and the args reuse the SysV
+    // integer registers except that rcx/r11 are destroyed by the instruction itself.
+    SyscallABI {
+        arch: "x86_64",
+        instruction: "syscall",
+        id_reg: "rax",
+        ret_reg: "rax",
+        arg_regs: &["rdi", "rsi", "rdx", "r10", "r8", "r9"],
+        clobbered: &["rcx", "r11"],
+        sys_write: 1,
+        sys_read: 0,
+        sys_close: 3,
+        sys_exit: 60,
+    }
 }
 
 /// Return the aarch64 Linux syscall ABI description
 pub fn aarch64_abi() -> SyscallABI {
-    // TODO: Fill in the aarch64 syscall ABI
-    // Hint: aarch64 uses the "svc #0" instruction, syscall number in x8
-    todo!()
+    // AArch64 follows the asm-generic table: x8 carries the number, x0..x5 the args.
+    // svc #0 preserves the link register and touches no hidden state, hence no clobbers.
+    SyscallABI {
+        arch: "aarch64",
+        instruction: "svc #0",
+        id_reg: "x8",
+        ret_reg: "x0",
+        arg_regs: &["x0", "x1", "x2", "x3", "x4", "x5"],
+        clobbered: &[],
+        sys_write: 64,
+        sys_read: 63,
+        sys_close: 57,
+        sys_exit: 93,
+    }
 }
 
 /// Return the riscv64 Linux syscall ABI description
 pub fn riscv64_abi() -> SyscallABI {
-    // TODO: Fill in the riscv64 syscall ABI
-    // Hint: riscv64 uses the "ecall" instruction, syscall number in a7
-    todo!()
+    // RISC-V ecall also uses the unified table: a7 selects the call, a0..a5 the args,
+    // a0 returns. Like AArch64 it clobbers nothing beyond the declared registers.
+    SyscallABI {
+        arch: "riscv64",
+        instruction: "ecall",
+        id_reg: "a7",
+        ret_reg: "a0",
+        arg_regs: &["a0", "a1", "a2", "a3", "a4", "a5"],
+        clobbered: &[],
+        sys_write: 64,
+        sys_read: 63,
+        sys_close: 57,
+        sys_exit: 93,
+    }
 }
 
 // ============================================================
@@ -82,24 +115,63 @@ pub fn riscv64_abi() -> SyscallABI {
 /// The caller must ensure the syscall number and arguments are valid.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub unsafe fn syscall3(id: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
-    // TODO: Implement x86_64 syscall using core::arch::asm!
-    // Hints:
-    //   - "syscall" instruction
-    //   - inlateout("rax") id => ret
-    //   - in("rdi") arg0, in("rsi") arg1, in("rdx") arg2
-    //   - out("rcx") _, out("r11") _
-    todo!()
+    // On x86_64 the number and the result share rax, hence inlateout. `syscall` saves
+    // the return address into rcx and corrupts r11 (the flags register is swapped into
+    // it), so both must be declared as dead outputs or the compiler may keep values there.
+    let ret: isize;
+    core::arch::asm!(
+        "syscall",
+        inlateout("rax") id => ret,
+        in("rdi") arg0,
+        in("rsi") arg1,
+        in("rdx") arg2,
+        out("rcx") _,
+        out("r11") _,
+        lateout("r8") _,
+        lateout("r9") _,
+        lateout("r10") _,
+        options(nostack),
+    );
+    ret
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub unsafe fn syscall3(id: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
-    // TODO: Implement aarch64 syscall using core::arch::asm!
-    // Hints:
-    //   - "svc #0" instruction
-    //   - in("x8") id
-    //   - inlateout("x0") arg0 => ret
-    //   - in("x1") arg1, in("x2") arg2
-    todo!()
+    // x0 doubles as the first argument and the return value, so it must be declared
+    // inlateout rather than in + out (which would let the compiler use two registers).
+    // Only memory/callee-saved state the kernel may touch is listed as a clobber.
+    let ret: isize;
+    core::arch::asm!(
+        "svc #0",
+        inlateout("x0") arg0 => ret,
+        in("x1") arg1,
+        in("x2") arg2,
+        in("x8") id,
+        lateout("x3") _,
+        lateout("x4") _,
+        lateout("x5") _,
+        options(nostack),
+    );
+    ret
+}
+
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+pub unsafe fn syscall3(id: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
+    // RISC-V keeps the number in a7 and the first argument/result in a0, so a0 is again
+    // an inlateout pair. ecall only touches the argument registers it was given.
+    let ret: isize;
+    core::arch::asm!(
+        "ecall",
+        inlateout("a0") arg0 => ret,
+        in("a1") arg1,
+        in("a2") arg2,
+        in("a7") id,
+        lateout("a3") _,
+        lateout("a4") _,
+        lateout("a5") _,
+        options(nostack),
+    );
+    ret
 }
 
 // Non-Linux platforms: provide a stub so the code compiles
@@ -127,38 +199,86 @@ const NATIVE_SYS_CLOSE: usize = 57;
 #[cfg(target_arch = "aarch64")]
 const NATIVE_SYS_EXIT: usize = 93;
 
+// riscv64 shares the asm-generic numbering with aarch64
+#[cfg(target_arch = "riscv64")]
+const NATIVE_SYS_WRITE: usize = 64;
+#[cfg(target_arch = "riscv64")]
+const NATIVE_SYS_READ: usize = 63;
+#[cfg(target_arch = "riscv64")]
+const NATIVE_SYS_CLOSE: usize = 57;
+#[cfg(target_arch = "riscv64")]
+const NATIVE_SYS_EXIT: usize = 93;
+
 // Fallback for other architectures (not actually used, just for compilation)
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
 const NATIVE_SYS_WRITE: usize = 0;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
 const NATIVE_SYS_READ: usize = 0;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
 const NATIVE_SYS_CLOSE: usize = 0;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
 const NATIVE_SYS_EXIT: usize = 0;
 
 /// Write data from `buf` to file descriptor `fd`.
 pub fn sys_write(fd: usize, buf: &[u8]) -> isize {
-    // TODO: Call syscall3 to implement write
-    todo!()
+    // A zero-length write is still issued: the kernel-side error checks stay observable.
+    unsafe { syscall3(NATIVE_SYS_WRITE, fd, buf.as_ptr() as usize, buf.len()) }
 }
 
 /// Read data from file descriptor `fd` into `buf`.
 pub fn sys_read(fd: usize, buf: &mut [u8]) -> isize {
-    // TODO: Call syscall3 to implement read
-    todo!()
+    unsafe { syscall3(NATIVE_SYS_READ, fd, buf.as_mut_ptr() as usize, buf.len()) }
 }
 
 /// Close file descriptor `fd`.
 pub fn sys_close(fd: usize) -> isize {
-    // TODO: Call syscall3 to implement close
-    todo!()
+    // close takes a single argument; the remaining slots are pinned to zero so no
+    // stale register contents leak into the kernel.
+    unsafe { syscall3(NATIVE_SYS_CLOSE, fd, 0, 0) }
 }
 
 /// Terminate the current process.
 pub fn sys_exit(code: i32) -> ! {
-    // TODO: Call syscall3 to implement exit
-    todo!()
+    // exit_group(207 on x86_64 / 94 on the generic table) tears down every thread of the
+    // process; plain exit would leave the other threads running under a freed address space.
+    // On the asm-generic table exit_group is exactly one above exit, so derive it.
+    #[cfg(target_arch = "x86_64")]
+    const SYS_EXIT_GROUP: usize = 231;
+    #[cfg(not(target_arch = "x86_64"))]
+    const SYS_EXIT_GROUP: usize = NATIVE_SYS_EXIT + 1;
+
+    unsafe {
+        syscall3(SYS_EXIT_GROUP, code as usize, 0, 0);
+    }
+    // The kernel never returns from exit; loop so this really diverges everywhere.
+    loop {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("hlt", options(nostack, nomem));
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("brk #1", options(nostack, nomem));
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        core::hint::spin_loop();
+    }
 }
 
 // ============================================================

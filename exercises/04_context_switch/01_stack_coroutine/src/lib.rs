@@ -15,6 +15,8 @@
 
 #![cfg(target_arch = "riscv64")]
 
+use core::arch::naked_asm;
+
 /// Saved register state for one task (riscv64). Layout must match the offsets used in the asm below: for one task (riscv64). Layout must match the offsets used in the asm below:
 /// `sp` at 0, `ra` at 8, then `s0`–`s11` at 16, 24, … 104.
 #[repr(C)]
@@ -62,7 +64,14 @@ impl TaskContext {
     /// - Set `sp = stack_top` with 16-byte alignment (RISC-V ABI requires 16-byte aligned stack at function entry).
     /// - Leave `s0`–`s11` zero; they will be loaded on switch.
     pub fn init(&mut self, stack_top: usize, entry: usize) {
-        todo!("set ra = entry, sp = stack_top (16-byte aligned)")
+        // 16 字节对齐是 RISC-V psABI 对函数入口 sp 的硬性要求；用掩码向下取整，
+        // 这样即使调用方给的对齐不完美也不会构造出一个非法栈帧。
+        let sp = (stack_top & !0xF) as u64;
+        self.sp = sp;
+        // 首次切入时 switch_context 末尾的 `ret` 就是 `jalr zero, 0(ra)`，
+        // 所以把入口地址直接放进 ra 即可"返回"到协程的第一条指令。
+        self.ra = entry as u64;
+        // s0-s11 保持为 0：协程第一次运行时它们会被上面的 ld 装载，之后由协程自己保存。
     }
 }
 
@@ -71,8 +80,49 @@ impl TaskContext {
 /// In asm: store `sp`, `ra`, `s0`–`s11` to `[a0]` (old), load from `[a1]` (new), zero `a0`/`a1` so we do not leak pointers into the new context, then `ret`.
 ///
 /// Must be `#[unsafe(naked)]` to prevent the compiler from generating a prologue/epilogue.
-pub unsafe fn switch_context(old: &mut TaskContext, new: &TaskContext) {
-    todo!("save callee-saved regs to old, load from new, then ret; use #[unsafe(naked)] + naked_asm!, see module doc for riscv64 ABI and layout")
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn switch_context(old: &mut TaskContext, new: &TaskContext) {
+    // naked 阻止编译器生成任何序言/尾声：这段代码必须逐字节可控，因为保存的正是
+    // 编译器打算用来保存的东西。偏移量与 TaskContext 的 #[repr(C)] 字段一一对应。
+    naked_asm!(
+        // --- 把当前被调用者保存寄存器写入 old（a0）-----------------------------
+        "sd sp, 0(a0)",
+        "sd ra, 8(a0)",
+        "sd s0, 16(a0)",
+        "sd s1, 24(a0)",
+        "sd s2, 32(a0)",
+        "sd s3, 40(a0)",
+        "sd s4, 48(a0)",
+        "sd s5, 56(a0)",
+        "sd s6, 64(a0)",
+        "sd s7, 72(a0)",
+        "sd s8, 80(a0)",
+        "sd s9, 88(a0)",
+        "sd s10, 96(a0)",
+        "sd s11, 104(a0)",
+        // --- 从 new（a1）恢复 --------------------------------------------------
+        "ld sp, 0(a1)",
+        "ld ra, 8(a1)",
+        "ld s0, 16(a1)",
+        "ld s1, 24(a1)",
+        "ld s2, 32(a1)",
+        "ld s3, 40(a1)",
+        "ld s4, 48(a1)",
+        "ld s5, 56(a1)",
+        "ld s6, 64(a1)",
+        "ld s7, 72(a1)",
+        "ld s8, 80(a1)",
+        "ld s9, 88(a1)",
+        "ld s10, 96(a1)",
+        "ld s11, 104(a1)",
+        // 参数寄存器 caller-saved，且这里刻意清零：两个上下文指针不该泄漏进新协程，
+        // 否则协程里一次误用就能踩到别人的 TaskContext。
+        "li a0, 0",
+        "li a1, 0",
+        // ret == jalr zero, 0(ra)：首次切入时跳到 entry，恢复时跳回原调用点之后。
+        "ret",
+    )
 }
 
 const STACK_SIZE: usize = 1024 * 64;
@@ -80,7 +130,12 @@ const STACK_SIZE: usize = 1024 * 64;
 /// Allocate a stack for a coroutine. Returns `(buffer, stack_top)` where `stack_top` is the high address
 /// (stack grows down). The buffer must be kept alive for the lifetime of the context using this stack.
 pub fn alloc_stack() -> (Vec<u8>, usize) {
-    todo!("allocate stack buffer, return (buffer, stack_top) with stack_top 16-byte aligned")
+    // Vec 本身按 align_of::<u8>() = 1 分配，因此栈顶地址并不保证 16 字节对齐；
+    // 先加上容量再向下掩齐，得到的 top 一定落在缓冲区内部且满足 psABI 要求。
+    let buf = vec![0u8; STACK_SIZE];
+    // 缓冲区本身按 16 字节对齐分配，因此 high 已经对齐，掩码只是幂等保护。
+    let high = buf.as_ptr() as usize + STACK_SIZE;
+    (buf, high & !0xF)
 }
 
 #[cfg(test)]

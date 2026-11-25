@@ -40,23 +40,56 @@ impl<T> SpinLock<T> {
     /// # Safety
     /// Caller must ensure `unlock` is called after using the data.
     pub fn lock(&self) -> &mut T {
-        // TODO
-        todo!()
+        // Plain TTAS (test-and-test-and-set): poll the flag with a *Relaxed load* and only
+        // issue the RMW once it reads false. This keeps the contended line in Shared state
+        // in the cache hierarchy instead of invalidating it on every attempt, which is what
+        // a naive compare_exchange loop does. The backoff doubles (capped) so that waiters
+        // stop synchronising on the same cache line at the same instant.
+        let mut backoff = 1u32;
+        loop {
+            while self.locked.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+                for _ in 0..backoff {
+                    core::hint::spin_loop();
+                }
+                backoff = (backoff * 2).min(64);
+            }
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return unsafe { &mut *self.data.get() };
+            }
+            // Lost the race against another spinner: reset and try again.
+            backoff = 1;
+        }
     }
 
     /// Release lock.
     ///
     /// TODO: Set locked to false (using Release ordering)
     pub fn unlock(&self) {
-        // TODO
-        todo!()
+        // Release: all writes made through the returned &mut T are visible to whoever
+        // next Acquires the lock. A plain store suffices — nobody can own the lock twice.
+        self.locked.store(false, Ordering::Release);
     }
 
     /// Try to acquire lock without spinning.
     /// Returns Some(&mut T) on success, None if lock is busy.
     pub fn try_lock(&self) -> Option<&mut T> {
-        // TODO: Single compare_exchange attempt
-        todo!()
+        // One attempt only, no spinning and no peek-first shortcut: peeking would report
+        // "busy" for a lock that is released microseconds later, which is fine here, but a
+        // single CAS is both cheaper to read and has no extra window of its own.
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(unsafe { &mut *self.data.get() })
+        } else {
+            None
+        }
     }
 }
 

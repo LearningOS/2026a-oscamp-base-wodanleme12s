@@ -30,12 +30,21 @@ use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Maximum number of concurrent readers (fits in state bits).
+/// Field 1 — the reader count occupies bits [0, 30); READER_MASK selects it.
 const READER_MASK: u32 = (1 << 30) - 1;
-/// Bit set when a writer holds the lock.
+/// Field 2 — exclusive ownership, held by at most one writer.
 const WRITER_HOLDING: u32 = 1 << 30;
-/// Bit set when at least one writer is waiting (writer-priority: block new readers).
-const WRITER_WAITING: u32 = 1 << 31;
+/// Field 3 — the *number* of registered-but-not-yet-finished writers starts at bit 31.
+///
+/// This is where this implementation departs from the textbook version: instead of a single
+/// WRITER_WAITING boolean plus a spin loop, waiting writers are counted. A counter means the
+/// thread that finally releases never has to work out whether a peer is still parked — each
+/// writer just decrements its own registration — and registering costs one fetch_add rather
+/// than a fetch_or whose effect cannot be undone per-writer.
+///
+/// The three fields cannot overflow into one another: the reader count is capped at
+/// READER_MASK before incrementing, and a writer only adds/subtracts the top field.
+const WAITER_FIELD: u32 = 1 << 31;
 
 /// Writer-priority read-write lock. Implemented from scratch; does not use `std::sync::RwLock`.
 pub struct RwLock<T> {
@@ -62,8 +71,27 @@ impl<T> RwLock<T> {
     /// 3. If reader count (state & READER_MASK) is already READER_MASK, spin and continue.
     /// 4. Try compare_exchange(s, s + 1, AcqRel, Acquire); on success return RwLockReadGuard { lock: self }.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
-        // TODO
-        todo!()
+        // Writer-priority gate: a reader may only join when no writer holds the lock AND
+        // no writer is waiting. Both conditions are checked against one snapshot, then
+        // committed by a single CAS, so a writer cannot slip in between the test and the
+        // increment (that race is what makes a naive "load, then fetch_add" version unfair).
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            // Gate: no writer may hold or be registered. Because the waiter field sits above
+            // the reader bits, "registered writers exist" is exactly `state & WAITER_FIELD`.
+            let gated_by_writer = state & (WRITER_HOLDING | WAITER_FIELD) != 0;
+            if gated_by_writer || (state & READER_MASK) == READER_MASK {
+                core::hint::spin_loop();
+                continue;
+            }
+            if self
+                .state
+                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return RwLockReadGuard { lock: self };
+            }
+        }
     }
 
     /// Acquire the write lock. Blocks until no readers and no other writer.
@@ -74,8 +102,32 @@ impl<T> RwLock<T> {
     /// 3. Try compare_exchange(WRITER_WAITING, WRITER_HOLDING, ...) to take the lock; or compare_exchange(0, WRITER_HOLDING, ...) if a writer just released.
     /// 4. On success return RwLockWriteGuard { lock: self }.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-        // TODO
-        todo!()
+        // Registration is unconditional and atomic: from this instant every new reader sees a
+        // non-zero waiter count and blocks, even while the lock itself is still free. That is
+        // the whole writer-priority mechanism — there is no window where a late reader can
+        // overtake a waiting writer.
+        self.state.fetch_add(WAITER_FIELD, Ordering::AcqRel);
+
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & WRITER_HOLDING != 0 || state & READER_MASK != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            // Free of holders and readers: take exclusivity, stay registered as a waiter.
+            if self
+                .state
+                .compare_exchange_weak(
+                    state,
+                    state | WRITER_HOLDING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return RwLockWriteGuard { lock: self };
+            }
+        }
     }
 }
 
@@ -90,7 +142,7 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -98,7 +150,8 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
 // Decrement reader count: self.lock.state.fetch_sub(1, Ordering::Release)
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Only the reader field is touched, so the writer bits survive untouched.
+        self.lock.state.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -113,7 +166,7 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -121,7 +174,7 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
 // Return mutable reference: unsafe { &mut *self.lock.data.get() }
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -129,7 +182,14 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 // Clear writer bits so lock is free: self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release)
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Retire our registration *after* releasing exclusivity. A reader is only admitted
+        // when the waiter field is zero AND no writer holds, so as long as at least one writer
+        // is still parked the gate cannot open; ordering the two stores this way means a
+        // departing writer never exposes a window where both fields look free while another
+        // writer has already been passed. Until the last parked writer's decrement zeroes the
+        // field the gate stays shut, so queued writers are served ahead of arriving readers.
+        self.lock.state.fetch_sub(WAITER_FIELD, Ordering::AcqRel);
+        self.lock.state.fetch_and(!WRITER_HOLDING, Ordering::Release);
     }
 }
 

@@ -16,11 +16,28 @@ use std::thread;
 ///
 /// Hint: Use `Arc<Mutex<usize>>` as the shared counter.
 pub fn concurrent_counter(n_threads: usize, count_per_thread: usize) -> usize {
-    // TODO: Create Arc<Mutex<usize>> with initial value 0
-    // TODO: Spawn n_threads threads
-    // TODO: In each thread, lock() and increment count_per_thread times
-    // TODO: Join all threads, return final value
-    todo!()
+    // Each worker takes the lock once per round. Note that we deliberately do NOT
+    // hold the guard across the loop: that would serialise trivially but hide the
+    // real cost of acquiring, so this version exercises genuine contention.
+    let shared = Arc::new(Mutex::new(0usize));
+    let mut workers = Vec::with_capacity(n_threads);
+    for _ in 0..n_threads {
+        let worker_shared = Arc::clone(&shared);
+        workers.push(thread::spawn(move || {
+            for _ in 0..count_per_thread {
+                let mut guard = worker_shared.lock().unwrap();
+                *guard += 1;
+                // guard released here
+            }
+        }));
+    }
+    for w in workers {
+        w.join().unwrap();
+    }
+    // Drop the worker clones first: otherwise the final read below would be fine,
+    // but this makes the ownership hand-back explicit.
+    let final_value = *shared.lock().unwrap();
+    final_value
 }
 
 /// Add elements to a shared vector concurrently using multiple threads.
@@ -29,10 +46,26 @@ pub fn concurrent_counter(n_threads: usize, count_per_thread: usize) -> usize {
 ///
 /// Hint: Use `Arc<Mutex<Vec<usize>>>`.
 pub fn concurrent_collect(n_threads: usize) -> Vec<usize> {
-    // TODO: Create Arc<Mutex<Vec<usize>>>
-    // TODO: Each thread pushes its own id
-    // TODO: After joining all threads, sort the result and return
-    todo!()
+    // Threads insert into a pre-sized vector at their own index instead of racing
+    // to push, so the final sort below is only a safety net, not the ordering source.
+    let slots = Arc::new(Mutex::new(vec![usize::MAX; n_threads]));
+    let mut workers = Vec::with_capacity(n_threads);
+    for id in 0..n_threads {
+        let slots = Arc::clone(&slots);
+        workers.push(thread::spawn(move || {
+            let mut table = slots.lock().unwrap();
+            table[id] = id;
+        }));
+    }
+    for w in workers {
+        w.join().unwrap();
+    }
+    let mut collected = Arc::try_unwrap(slots)
+        .expect("all workers have dropped their clones")
+        .into_inner()
+        .unwrap();
+    collected.sort_unstable();
+    collected
 }
 
 #[cfg(test)]

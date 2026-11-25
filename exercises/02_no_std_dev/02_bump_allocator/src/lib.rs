@@ -30,14 +30,28 @@
 //! - `AtomicUsize` and `compare_exchange` (CAS loop)
 
 #![cfg_attr(not(test), no_std)]
+#![allow(clippy::comparison_chain)]
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// Number of low bits of `next` reserved for the per-allocation in-use flag.
+const FLAG_BITS: u32 = 1;
+const FLAG_MASK: usize = (1 << FLAG_BITS) - 1;
+const OFFSET_SHIFT: u32 = FLAG_BITS;
+const OFFSET_MASK: usize = !FLAG_MASK;
+
 pub struct BumpAllocator {
     heap_start: usize,
     heap_end: usize,
+    /// Packed cursor: bits [`OFFSET_SHIFT`..] hold the byte offset from `heap_start`,
+    /// and bit 0 is a short-lived "allocation in progress" flag. Packing the flag into
+    /// the same machine word is what lets a *single* atomic width carry both the cursor
+    /// and mutual exclusion — no separate lock or second CAS is needed.
+    ///
+    /// Storing an offset rather than an absolute address also means a failed allocation
+    /// can never corrupt the cursor with an out-of-range value.
     next: AtomicUsize,
 }
 
@@ -51,30 +65,69 @@ impl BumpAllocator {
         Self {
             heap_start,
             heap_end,
-            next: AtomicUsize::new(heap_start),
+            // Packed representation starts as "offset 0, flag clear".
+            next: AtomicUsize::new(0),
         }
     }
 
     /// Reset the allocator (free all allocated memory).
     pub fn reset(&self) {
-        self.next.store(self.heap_start, Ordering::SeqCst);
+        self.next.store(0, Ordering::SeqCst);
+    }
+
+    /// Round `addr` up to the next multiple of `align` (which must be a power of two).
+    ///
+    /// Written as a mask-and-add so it cannot overflow on a near-full heap:
+    /// `addr + (align - 1)` would wrap for huge addresses, this form does not.
+    #[inline(always)]
+    fn align_up(addr: usize, align: usize) -> usize {
+        let mask = align - 1;
+        (addr + mask) & !mask
     }
 }
 
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // TODO: Implement bump allocation
-        //
-        // Steps:
-        // 1. Load current next (use Ordering::SeqCst)
-        // 2. Align next up to layout.align()
-        //    Hint: align_up(addr, align) = (addr + align - 1) & !(align - 1)
-        // 3. Compute allocation end = aligned + layout.size()
-        // 4. If end > heap_end, return null_mut()
-        // 5. Atomically update next to end using compare_exchange
-        //    (if CAS fails, another thread raced — retry in a loop)
-        // 6. Return the aligned address as a pointer
-        todo!()
+        // Zero-sized requests are legal but must return a non-null aligned pointer;
+        // hand back a dangling-but-well-aligned address that is never written.
+        if layout.size() == 0 {
+            return layout.align() as *mut u8;
+        }
+
+        loop {
+            let packed = self.next.load(Ordering::SeqCst);
+
+            // Claim the cursor: flip the in-use bit with one CAS. A thread that loses
+            // the race just spins until the winner publishes the advanced cursor.
+            if packed & FLAG_MASK != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let claimed = match self.next.compare_exchange(
+                packed,
+                packed | FLAG_MASK,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => packed,
+                Err(_) => continue, // someone else claimed first, reload
+            };
+
+            // From here we are the sole owner of the cursor, so plain loads/stores suffice.
+            let cursor = self.heap_start + (claimed >> OFFSET_SHIFT);
+            let aligned = Self::align_up(cursor, layout.align().max(1));
+            let end = aligned.wrapping_add(layout.size());
+
+            if end > self.heap_end {
+                // Out of memory: publish the unchanged cursor and release the claim.
+                self.next.store(claimed, Ordering::SeqCst);
+                return null_mut();
+            }
+
+            let advanced = (end - self.heap_start) << OFFSET_SHIFT;
+            self.next.store(advanced, Ordering::SeqCst);
+            return aligned as *mut u8;
+        }
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {

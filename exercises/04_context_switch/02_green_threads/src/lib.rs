@@ -56,7 +56,11 @@ struct GreenThread {
     entry: Option<extern "C" fn()>,
 }
 
-/// Set by the scheduler before switching to a new thread; `thread_wrapper` reads and calls it once.
+/// 调度器在切入新线程前写入，`thread_wrapper` 读取并只调用一次。
+///
+/// 为什么不用现成的写法（把 entry 指针压进新线程栈顶，靠 `ret` 逐级弹出）：那种做法要求
+/// 我们精确伪造一个"看起来像正常函数调用"的栈帧，编译器一改内联/序言策略就会静默失效。
+/// 这里改为**单一交接槽位**：wrapper 本身就是 ra，入口通过全局槽传递，栈里不需要任何伪造帧。
 static mut CURRENT_THREAD_ENTRY: Option<extern "C" fn()> = None;
 
 /// Wrapper run as the initial `ra` for each green thread: call the user entry (from `CURRENT_THREAD_ENTRY`), then mark Finished and switch back.
@@ -137,7 +141,20 @@ impl Scheduler {
     ///    `sp` must be 16-byte aligned (e.g. `(stack_top - 16) & !15` to leave headroom).
     /// 3. Push a `GreenThread` with this context, state `Ready`, and `entry` stored for the wrapper to call.
     pub fn spawn(&mut self, entry: extern "C" fn()) {
-        todo!("alloc stack, init ctx with ra=thread_wrapper and aligned sp, push GreenThread(Ready, entry)")
+        let stack = vec![0u8; STACK_SIZE];
+        // 栈向下增长：sp 取缓冲区末尾并向 16 字节掩齐。wrapper 是个正常的 extern "C" 函数，
+        // 会自己建立序言，所以切入时 sp 只需满足 ABI 的对齐要求，不必预留返回地址槽位。
+        let stack_top = stack.as_ptr() as usize + STACK_SIZE;
+        let mut ctx = TaskContext::default();
+        ctx.sp = (stack_top & !0xF) as u64;
+        ctx.ra = thread_wrapper as *const () as u64;
+
+        self.threads.push(GreenThread {
+            ctx,
+            state: ThreadState::Ready,
+            _stack: Some(stack),
+            entry: Some(entry),
+        });
     }
 
     /// Run the scheduler until all threads (except the main one) are `Finished`.
@@ -146,12 +163,70 @@ impl Scheduler {
     /// 2. Loop: if all threads in `threads[1..]` are `Finished`, break; otherwise call `schedule_next()` (which may switch away and later return).
     /// 3. Clear `SCHEDULER` when done.
     pub fn run(&mut self) {
-        todo!("set SCHEDULER to self, loop until threads[1..] all Finished, call schedule_next, then clear SCHEDULER")
+        // yield_now()/thread_finished() 是无参数自由函数，只能靠这个全局指针回调回来。
+        unsafe {
+            SCHEDULER = self as *mut Scheduler;
+        }
+
+        // 终止条件用"就绪集合是否为空"而不是"是否全部 Finished"：主线程自己不在轮转里，
+        // 而它一旦被切出去就可能再也不会回来执行这个判断。改成先数一遍还有没有可跑的子线程，
+        // 没有了就直接返回，避免依赖"从子线程切回主线程后继续循环"这一脆弱前提。
+        loop {
+            let runnable = self
+                .threads
+                .iter()
+                .skip(1)
+                .any(|t| t.state != ThreadState::Finished);
+            if !runnable {
+                break;
+            }
+
+            // schedule_next 可能根本不切换（例如只剩一个就绪线程且它就是当前线程）。
+            // 若切换成功后控制权回到这里，说明某个子线程让出或结束了，继续轮转即可。
+            self.schedule_next();
+        }
+
+        unsafe {
+            SCHEDULER = core::ptr::null_mut();
+        }
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
     fn schedule_next(&mut self) {
-        todo!("round-robin find next Ready, set current Ready (if not Finished), next Running, CURRENT_THREAD_ENTRY, then switch_context")
+        let len = self.threads.len();
+        // 环形扫描的范围是 1..=len：包含 offset == len，也就是"重新考虑自己"。
+        // 这一点很关键——当唯一一个就绪线程就是当前正在跑的线程时（task_b 结束后只剩
+        // task_a），旧写法会找不到目标而原地返回，主循环随即空转；把自身纳入候选后，
+        // 该线程只是继续执行，等它下一次 yield 时自然推进到结束判定。
+        for offset in 1..=len {
+            let next = (self.current + offset) % len;
+            if self.threads[next].state == ThreadState::Ready {
+                let previous = self.current;
+                if self.threads[previous].state != ThreadState::Finished {
+                    self.threads[previous].state = ThreadState::Ready;
+                }
+                self.threads[next].state = ThreadState::Running;
+                self.current = next;
+
+                // 首次被调度时把入口交给 wrapper；之后 take() 返回 None，wrapper 不会再调用它。
+                unsafe {
+                    CURRENT_THREAD_ENTRY = self.threads[next].entry.take();
+                }
+
+                // 自切换（next == current）必须跳过 switch_context：此时 old 与 new 是同一块
+                // 内存，先把 sp/ra 写进去再从同处读回虽然看似无害，但紧接着的 `ret` 会跳到刚
+                // 被覆写的 ra（即 wrapper 本身），造成入口被重复调用。直接返回即可。
+                if previous != next {
+                    // 借用检查：old 需要 &mut、new 需要 &，二者指向同一 Vec 的不同元素，
+                    // 因此拆成两个裸指针再构造引用，语义上与手动上下文切换一致。
+                    let old = self.threads[previous].ctx.as_mut_ptr();
+                    let new = self.threads[next].ctx.as_ptr();
+                    unsafe { switch_context(&mut *old, &*new) };
+                }
+                return;
+            }
+        }
+        // 没有别的就绪线程：什么都不做，调用方（主循环或 yield 的线程）继续跑。
     }
 }
 

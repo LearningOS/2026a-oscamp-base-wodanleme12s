@@ -33,7 +33,17 @@ impl Future for CountDown {
     type Output = &'static str;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        // CountDown is Unpin, so get_mut is available without any unsafe projection.
+        let this = self.get_mut();
+        if this.count == 0 {
+            return Poll::Ready("liftoff!");
+        }
+        this.count -= 1;
+        // Wake immediately: we have no timer or external event to wait for, so the only way
+        // to be polled again is to ask the runtime to re-enter us. Without this call the
+        // task would park forever with Pending still outstanding.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -57,7 +67,16 @@ impl Future for YieldOnce {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        todo!()
+        let this = self.get_mut();
+        if this.yielded {
+            Poll::Ready(())
+        } else {
+            // One voluntary rescheduling: arm ourselves for a second poll and report Pending,
+            // which is precisely how an executor implements cooperative task interleaving.
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
     }
 }
 

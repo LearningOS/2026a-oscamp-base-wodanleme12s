@@ -14,10 +14,19 @@ use tokio::time::{sleep, Duration};
 ///
 /// Hint: Create `tokio::spawn` task for each i, collect JoinHandle, await them sequentially.
 pub async fn concurrent_squares(n: usize) -> Vec<usize> {
-    // TODO: Create n asynchronous tasks, each computing i * i
-    // TODO: Collect all JoinHandle
-    // TODO: Await each one to get result
-    todo!()
+    // Spawn everything first, then await in index order: awaiting inside the loop would
+    // serialise the tasks and defeat the point of spawn. Handles are pre-sized so results
+    // land at their natural index without a later sort.
+    let mut handles: Vec<JoinHandle<usize>> = Vec::with_capacity(n);
+    for i in 0..n {
+        handles.push(tokio::spawn(async move { i * i }));
+    }
+
+    let mut squares = Vec::with_capacity(n);
+    for handle in handles {
+        squares.push(handle.await.expect("square task panicked"));
+    }
+    squares
 }
 
 /// Concurrently execute multiple "time-consuming" tasks (simulated with sleep), return all results.
@@ -25,10 +34,24 @@ pub async fn concurrent_squares(n: usize) -> Vec<usize> {
 ///
 /// Key: All tasks should execute concurrently, total duration should be close to single task duration, not sum of all tasks.
 pub async fn parallel_sleep_tasks(n: usize, duration_ms: u64) -> Vec<usize> {
-    // TODO: Create asynchronous task for each id in 0..n
-    // TODO: Each task sleeps specified duration and returns its own id
-    // TODO: Collect all results and sort
-    todo!()
+    // sleep() only yields this task, it never blocks the worker thread, so all n tasks make
+    // progress concurrently and total wall time stays near a single duration_ms.
+    let mut handles: Vec<JoinHandle<usize>> = Vec::with_capacity(n);
+    for id in 0..n {
+        handles.push(tokio::spawn(async move {
+            sleep(Duration::from_millis(duration_ms)).await;
+            id
+        }));
+    }
+
+    let mut finished = Vec::with_capacity(n);
+    for handle in handles {
+        finished.push(handle.await.expect("sleep task panicked"));
+    }
+    // Completion order follows the awaited handle order, not wake-up order; sorting keeps the
+    // contract explicit even if the collection strategy changes.
+    finished.sort_unstable();
+    finished
 }
 
 #[cfg(test)]
